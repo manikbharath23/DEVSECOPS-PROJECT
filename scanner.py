@@ -2,115 +2,102 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
 import subprocess
 import os
-import re
+import threading
+import shutil
 
 selected_file = None
-
-# -----------------------------
-# 1) Check file type
-# -----------------------------
-def is_code_file(file_path: str) -> bool:
-    code_extensions = [
-        ".py", ".java", ".c", ".cpp", ".js", ".rb", ".go", ".php",
-        ".html", ".css", ".ts", ".json", ".yml", ".yaml", ".sh"
-    ]
-    ext = os.path.splitext(file_path)[1]
-    return ext.lower() in code_extensions
+scan_process = None
+stop_scan_flag = False
 
 
-# -----------------------------
-# 2) SDLC Phase detection logic
-# -----------------------------
+# ✅ SDLC phase detection logic
 def get_sdlc_phase(description: str) -> str:
-    d = description.lower()
+    description = description.lower()
 
-    if "hardcoded" in d or "credential" in d or "password" in d or "secret" in d:
-        return "Requirement Phase (Secrets)"
-    elif any(kw in d for kw in ["eval", "exec", "pickle", "yaml.load", "os.system", "subprocess"]):
+    if "hardcoded" in description or "credential" in description or "password" in description:
+        return "Requirement Phase"
+    elif any(kw in description for kw in ["eval", "exec", "pickle", "yaml.load", "os.system", "subprocess"]):
         return "Implementation Phase"
-    elif any(kw in d for kw in ["input", "validation", "sanitize"]):
-        return "Design/Implementation Phase"
-    elif any(kw in d for kw in ["assert", "try", "exception", "error"]):
-        return "Testing Phase"
-    elif any(kw in d for kw in ["debug", "print", "logging"]):
+    elif "input" in description or "validation" in description:
+        return "Requirement Phase"
+    elif "debug" in description or "print" in description:
         return "Deployment/Maintenance Phase"
+    elif any(kw in description for kw in ["assert", "try", "exception"]):
+        return "Testing Phase"
+    elif any(kw in description for kw in ["blacklist", "cipher", "ciphers"]):
+        return "Design Phase"
     else:
         return "Implementation Phase"
 
 
-# -----------------------------
-# 3) Parse Bandit output
-# -----------------------------
+# ✅ Parse Bandit output for issues and SDLC phase
 def parse_bandit_output(output: str):
     issues = []
     lines = output.splitlines()
-    i = 0
 
-    while i < len(lines):
-        line = lines[i].strip()
-
-        if line.startswith(">> Issue:"):
+    for i in range(len(lines)):
+        if ">> Issue:" in lines[i]:
             issue = {
-                "description": line.replace(">> Issue:", "").strip(),
+                "description": lines[i].strip(),
                 "severity": "",
                 "confidence": "",
                 "file": "",
                 "line": "",
                 "code": "",
-                "phase": ""
+                "phase": get_sdlc_phase(lines[i]),
             }
 
-            j = i + 1
-            while j < len(lines) and j <= i + 12:
-                l = lines[j].strip()
+            for j in range(i + 1, min(i + 12, len(lines))):
+                if "Severity:" in lines[j]:
+                    parts = lines[j].split()
+                    # Example: Severity: Low   Confidence: High
+                    if len(parts) >= 4:
+                        issue["severity"] = parts[1]
+                        issue["confidence"] = parts[3]
 
-                if l.startswith("Severity:"):
-                    sev_match = re.search(r"Severity:\s*(\w+)", l)
-                    conf_match = re.search(r"Confidence:\s*(\w+)", l)
-                    if sev_match:
-                        issue["severity"] = sev_match.group(1)
-                    if conf_match:
-                        issue["confidence"] = conf_match.group(1)
-
-                elif l.startswith("Location:"):
-                    loc = l.replace("Location:", "").strip()
+                elif "Location:" in lines[j]:
+                    loc = lines[j].replace("Location:", "").strip()
+                    # Example: .\scanner.py:118:23
                     if ":" in loc:
-                        file_part, line_part = loc.rsplit(":", 1)
-                        issue["file"] = file_part.strip()
-                        issue["line"] = line_part.strip()
-                    else:
-                        issue["file"] = loc
+                        p = loc.split(":")
+                        issue["file"] = p[0].strip()
+                        issue["line"] = p[1].strip() if len(p) > 1 else ""
 
-                elif l.startswith("Code:"):
-                    issue["code"] = l.replace("Code:", "").strip()
+                elif lines[j].strip() and not lines[j].strip().startswith("---"):
+                    # code line
+                    issue["code"] = lines[j].strip()
+                    break
 
-                j += 1
-
-            issue["phase"] = get_sdlc_phase(issue["description"])
             issues.append(issue)
-            i = j
-            continue
-
-        i += 1
 
     return issues
 
 
-# -----------------------------
-# 4) Upload file
-# -----------------------------
+# ✅ File type checker
+def is_code_file(file_path: str) -> bool:
+    code_extensions = [
+        ".py", ".java", ".c", ".cpp", ".js", ".rb", ".go",
+        ".php", ".html", ".css", ".ts"
+    ]
+    ext = os.path.splitext(file_path)[1]
+    return ext.lower() in code_extensions
+
+
+# ✅ File upload
 def upload_file():
     global selected_file
     selected_file = filedialog.askopenfilename()
+
     if selected_file:
         output_text.delete(1.0, tk.END)
-        output_text.insert(tk.END, f"File selected: {selected_file}\n")
+        output_text.insert(tk.END, f"✅ File selected: {selected_file}\n")
 
 
-# -----------------------------
-# 5) Scan file using bandit
-# -----------------------------
+# ✅ Start scan (runs in thread)
 def process_scan():
+    global stop_scan_flag
+
+    stop_scan_flag = False
     output_text.delete(1.0, tk.END)
 
     if not selected_file:
@@ -118,50 +105,105 @@ def process_scan():
         return
 
     file_path = selected_file
-    output_text.insert(tk.END, f"Scanning file: {file_path}\n\n")
+    output_text.insert(tk.END, f"🔍 Scanning file: {file_path}\n\n")
 
     if not is_code_file(file_path):
-        output_text.insert(tk.END, "This is NOT a code file/application. No scan needed.\n")
-        messagebox.showinfo("Non-Code File", "This file is not a code/executable file. No scan needed.")
+        output_text.insert(tk.END, "❌ This is NOT a code file or application.\n")
+        messagebox.showinfo("Non-Code File", "This is not a code file. No scan needed.")
         return
 
+    # ✅ Disable Start while scanning
+    scan_btn.config(state=tk.DISABLED)
+    stop_btn.config(state=tk.NORMAL)
+
+    # ✅ Scan in separate thread to avoid GUI freeze
+    thread = threading.Thread(target=run_bandit_scan, args=(file_path,))
+    thread.start()
+
+
+# ✅ Stop scan
+def stop_scan():
+    global scan_process, stop_scan_flag
+
+    stop_scan_flag = True
+
     try:
-        result = subprocess.run(
-            ["bandit", "-r", file_path],
+        if scan_process and scan_process.poll() is None:
+            output_text.insert(tk.END, "\n🛑 Stopping scan...\n")
+            scan_process.terminate()
+    except Exception as e:
+        output_text.insert(tk.END, f"\n❌ Unable to stop scan: {e}\n")
+
+    reset_buttons()
+
+
+# ✅ Reset UI buttons
+def reset_buttons():
+    scan_btn.config(state=tk.NORMAL)
+    stop_btn.config(state=tk.DISABLED)
+
+
+# ✅ Bandit scan actual logic
+def run_bandit_scan(file_path: str):
+    global scan_process, stop_scan_flag
+
+    try:
+        bandit_path = shutil.which("bandit")
+        if not bandit_path:
+            output_text.insert(tk.END, "❌ Bandit not found.\n")
+            output_text.insert(tk.END, "👉 Install: pip install bandit\n")
+            messagebox.showerror("Bandit Missing", "Bandit tool not installed. Run: pip install bandit")
+            reset_buttons()
+            return
+
+        # ✅ Full path used -> fixes B607 partial path warning
+        # ✅ shell=False already safer
+        scan_process = subprocess.Popen(  # nosec B603
+            [bandit_path, "-r", file_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True
+            text=True,
+            shell=False
         )
 
-        output = result.stdout
-        issues = parse_bandit_output(output)
+        stdout, stderr = scan_process.communicate()
+
+        if stop_scan_flag:
+            output_text.insert(tk.END, "\n🛑 Scan stopped by user.\n")
+            reset_buttons()
+            return
+
+        if stderr:
+            output_text.insert(tk.END, f"⚠️ Bandit Error:\n{stderr}\n")
+
+        issues = parse_bandit_output(stdout)
 
         if issues:
-            output_text.insert(tk.END, "Vulnerabilities found ✅\n\n")
-            for idx, issue in enumerate(issues, start=1):
-                output_text.insert(tk.END, f"{idx}) {issue['description']}\n")
+            output_text.insert(tk.END, "🚨 Vulnerabilities found:\n\n")
+            for issue in issues:
+                output_text.insert(tk.END, f"{issue['description']}\n")
                 output_text.insert(tk.END, f"   Severity: {issue['severity']} | Confidence: {issue['confidence']}\n")
                 output_text.insert(tk.END, f"   Location: {issue['file']}  Line: {issue['line']}\n")
-                if issue["code"]:
-                    output_text.insert(tk.END, f"   Code: {issue['code']}\n")
-                output_text.insert(tk.END, f"   SDLC Phase: {issue['phase']}\n\n")
+                output_text.insert(tk.END, f"   Code: {issue['code']}\n")
+                output_text.insert(tk.END, f"   SDLC Phase: {issue['phase']}\n")
+                output_text.insert(tk.END, "-" * 75 + "\n")
 
-            messagebox.showwarning("Scan Complete", "Vulnerabilities detected! See output.")
+            messagebox.showwarning("Scan Complete", "Vulnerabilities detected! See the output.")
         else:
-            output_text.insert(tk.END, "This is a secure code/application ✅\nNo vulnerabilities found.\n")
-            messagebox.showinfo("Safe", "No vulnerabilities found. File is secure.")
+            output_text.insert(tk.END, "✅ This is secure code/application. No vulnerabilities found.\n")
+            messagebox.showinfo("Safe", "No vulnerabilities found. The file is secure.")
 
     except Exception as e:
-        output_text.insert(tk.END, f"Error: {str(e)}\n")
-        messagebox.showerror("Error", "An error occurred during scanning.")
+        output_text.insert(tk.END, f"❌ Error: {str(e)}\n")
+        messagebox.showerror("Error", f"An error occurred during scanning.\n{e}")
+
+    reset_buttons()
 
 
-# -----------------------------
-# 6) GUI setup
-# -----------------------------
+# ✅ GUI Setup
 root = tk.Tk()
 root.title("Vulnerability Scanner Tool")
-root.geometry("900x550")
+root.geometry("800x500")
 root.config(bg="black")
 
 title = tk.Label(
@@ -179,8 +221,7 @@ upload_btn = tk.Button(
     command=upload_file,
     width=20,
     bg="darkorange",
-    fg="white",
-    font=("Arial", 12, "bold")
+    fg="white"
 )
 upload_btn.pack(pady=5)
 
@@ -190,16 +231,26 @@ scan_btn = tk.Button(
     command=process_scan,
     width=20,
     bg="green",
-    fg="white",
-    font=("Arial", 12, "bold")
+    fg="white"
 )
 scan_btn.pack(pady=5)
+
+stop_btn = tk.Button(
+    root,
+    text="Stop Scan",
+    command=stop_scan,
+    width=20,
+    bg="red",
+    fg="white",
+    state=tk.DISABLED
+)
+stop_btn.pack(pady=5)
 
 output_text = scrolledtext.ScrolledText(
     root,
     wrap=tk.WORD,
-    width=110,
-    height=22,
+    width=100,
+    height=18,
     bg="black",
     fg="white",
     font=("Courier", 10)
